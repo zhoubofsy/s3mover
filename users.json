@@ -1,0 +1,34 @@
+[
+	{
+		"from":{
+			"host":"10.100.13.111", 
+			"port":7480, 
+			"access":"8I4K2USDV5SK3UFLQUB0", 
+			"secret":"A4JuvB468tmnDpmkZMfwesb2zmGZeSiCJlzJMALc"
+		},
+		"to":{
+			"host":"10.100.13.112",
+			"port":7480,
+			"access":"8I4K2USDV5SK3UFLQUB0",
+			"secret":"A4JuvB468tmnDpmkZMfwesb2zmGZeSiCJlzJMALc"
+		},
+        "bucketmap":{
+            "a-test-bkt":"new-a-test-bkt",
+            "dest-bkt":"new-dest-bkt"
+        }
+	},
+	{
+		"from":{
+			"host":"10.100.13.111", 
+			"port":7480, 
+			"access":"8I4K2USDV5SK3UFLQUB0", 
+			"secret":"A4JuvB468tmnDpmkZMfwesb2zmGZeSiCJlzJMALc"
+		},
+		"to":{
+			"host":"10.100.13.112", 
+			"port":7480, 
+			"access":"8I4K2USDV5SK3UFLQUB0", 
+			"secret":"A4JuvB468tmnDpmkZMfwesb2zmGZeSiCJlzJMALc"
+		}
+	}
+]

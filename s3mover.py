@@ -5,18 +5,27 @@
 Python script to sync the contents of one S3 user with another S3 user.
 This script will work even if the buckets are in different cluster.
 '''
-
+import pdb
+import leveldb
+from multiprocessing import Pool
 from boto.exception import S3ResponseError
 from boto.s3.connection import OrdinaryCallingFormat
 from boto.s3.connection import S3Connection
 from Queue import LifoQueue
+from filechunkio import FileChunkIO
 import threading
 import time
+import math
 import logging
 import os
 import argparse
 import json
+import sys
 
+reload(sys)
+sys.setdefaultencoding('utf-8')
+
+DB_PATH_ROOT = "./data"
 # Log everything, and send it to stderr.
 logging.basicConfig(level=logging.WARN)
 
@@ -66,13 +75,13 @@ class S3Connector(S3Connection):
             self.calling_format = cformat
         super(S3Connector, self).__init__(access, secret, https, port, host=addr, calling_format=self.calling_format)
         # S3Connection.__init__(self, access, secret, https, port, host=addr, calling_format=self.calling_format)
-
+   
 def sync_obj_attrs(f,t):
     # acl
     sync_acl(f,t)
 
 class ObjWorker(threading.Thread):
-    def __init__(self, thread_id, queue, from_connector, from_bucket, to_connector, to_bucket, overwrite=False, verbose=False):
+    def __init__(self, thread_id, queue, from_connector, from_bucket, to_connector, to_bucket, overwrite=False, verbose=False, db=None):
         super(ObjWorker, self).__init__()
         self.thread_id = thread_id
         self.queue = queue
@@ -82,6 +91,10 @@ class ObjWorker(threading.Thread):
         self.to_bucket = to_bucket
         self.verbose_enable = verbose
         self.overwrite = overwrite
+        # >= 100MB Multipart
+        self.mp_size = 100*1024*1024
+        self.chunksize = 50*1024*1024
+        self.db = db
 
     def run(self):
         while True:
@@ -92,37 +105,61 @@ class ObjWorker(threading.Thread):
                 # across cluster copy object
                 # Judge key exists
                 # Judge diffrent etag and allow overwrite
-                if (not to_key and not to_key.exists()) or (self.overwrite and from_key.etag != to_key.etag) :
-                    from_key.get_contents_to_filename(from_key.name)
-                    to_key = self.to_bucket.new_key(from_key.name)
-                    to_key.set_contents_from_filename(from_key.name)
-                    if os.path.exists(from_key.name):
-                        os.remove(from_key.name)
-                    print '  t%s: Copy: %s' % (self.thread_id, from_key.key)
+                try:
+                    last_modified = self.db.Get(from_key.name)
+                except KeyError:
+                    last_modified = None
+                if (not to_key or not to_key.exists()) or (self.overwrite and from_key.last_modified != last_modified) :
+                    path = self.from_bucket.name + '/' + from_key.name
+                    from_key.get_contents_to_filename(path)
+                    obj_size = os.path.getsize(path)
+                    if obj_size < self.mp_size:
+                        to_key = self.to_bucket.new_key(from_key.name)
+                        to_key.set_contents_from_filename(path)
+                    else:
+                        # multi-part upload
+                        mp = self.to_bucket.initiate_multipart_upload(from_key.name)
+                        count = int(math.ceil(obj_size / float(self.chunksize)))
+                        for idx in range(count):
+                            offset = self.chunksize * idx
+                            bs = min(self.chunksize, obj_size - offset)
+                            p = FileChunkIO(path, 'r', offset=offset, bytes=bs)
+                            mp.upload_part_from_file(p, part_num=idx+1)
+                        mp.complete_upload()
+                        to_key = self.to_bucket.get_key(from_key.key)
+                    # remove local obj
+                    if os.path.exists(path):
+                        os.remove(path)
+                    # Set object's ACL
+                    sync_obj_attrs(from_key, to_key)
+                    print '  PID_%s t%s: Copy: %s' % (os.getpid(), self.thread_id, from_key.key)
+                    self.db.Put(from_key.name, from_key.last_modified)
                 else:
                     if self.verbose_enable:
-                        print '  t%s: Exists and etag matches: %s' % (self.thread_id, to_key)
+                        print '  PID_%s t%s: %s Exists and last modified : %s' % (os.getpid(),self.thread_id, to_key, last_modified)
             except BaseException:
                 logging.exception('  t%s: error during copy' % self.thread_id)
 
-            # Set object's ACL
-            # Don't sync ACL , diffrent key's etag and not allow overwrite
-            if not ( not self.overwrite and from_key.etag != to_key.etag ):
-                sync_obj_attrs(from_key, to_key)
             # Phase done
             self.queue.task_done()
 
 def copy_objects(from_conn, to_conn, from_bkt, to_bkt, thd_count, overwrite=False, verbose=False):
     max_keys = 1000
     result_marker = ''
+    db_path = DB_PATH_ROOT + "/" + from_conn.name + "/" + from_bkt.name
+    if not os.path.exists(db_path):
+        os.makedirs(db_path)
+    db = leveldb.LevelDB(db_path)
     q = LifoQueue(maxsize=5000)
 
     # Dispatch tasks to ObjWorker from LifoQueue
     for i in xrange(thd_count):
-        t = ObjWorker(i, q, from_conn, from_bkt, to_conn, to_bkt, overwrite, verbose)
+        t = ObjWorker(i, q, from_conn, from_bkt, to_conn, to_bkt, overwrite, verbose, db)
         t.daemon = True
         t.start()
-
+ 
+    if not os.path.exists(from_bkt.name):
+        os.mkdir(from_bkt.name)
     # Add tasks to LifoQueue
     i = 0
     while True:
@@ -142,6 +179,7 @@ def copy_objects(from_conn, to_conn, from_bkt, to_bkt, thd_count, overwrite=Fals
             logging.exception('error during fetch, quit')
             break
     q.join()
+    os.rmdir(from_bkt.name)
 
 def sync_bucket_attrs(f,t):
     # acl
@@ -157,11 +195,13 @@ def sync_bucket_attrs(f,t):
     # versioning
     sync_versioning(f,t)
 
-def copy_buckets(from_user_connector = None, to_user_connector = None, thread_count=1, overwrite=False, verbose=False, bmap=None):
+def copy_buckets(from_user_connector = None, to_user_connector = None, thread_count=1, overwrite=False, verbose=False, bmap=None, jobs=1):
     if from_user_connector == None or to_user_connector == None:
         return
     from_conn = from_user_connector
     to_conn = to_user_connector
+    #pdb.set_trace()
+    p = Pool(jobs)
     # For each bucket via 'from_conn'
     for item_frm in from_conn.get_all_buckets():
         if bmap != None and bmap.get(item_frm.name, None) != None:
@@ -180,9 +220,13 @@ def copy_buckets(from_user_connector = None, to_user_connector = None, thread_co
             # sync bucket attrs
             sync_bucket_attrs(item_frm, item_to)
         # sync objects
-        copy_objects(from_conn, to_conn, item_frm, item_to, thread_count, overwrite, verbose)
+        # copy_objects(from_conn, to_conn, item_frm, item_to, thread_count, overwrite, verbose)
+        # !!!Dangerous!!!
+        p.apply_async(copy_objects, args=(from_conn, to_conn, item_frm, item_to, thread_count, overwrite, verbose))
+    p.close()
+    p.join()
 
-def sync_users(users_config = None, thread_count=1, allow_ow=False, verbose=False):
+def sync_users(users_config = None, thread_count=1, allow_ow=False, verbose=False, jobs=1):
     users_info = None
     if os.path.exists(users_config):
         f = open(users_config)
@@ -190,6 +234,7 @@ def sync_users(users_config = None, thread_count=1, allow_ow=False, verbose=Fals
         
     if users_info != None:
         for user in users_info:
+            username = user.get('name')
             inf_from = user.get('from')
             inf_to = user.get('to')
             bkt_map = user.get('bucketmap', None)
@@ -204,10 +249,10 @@ def sync_users(users_config = None, thread_count=1, allow_ow=False, verbose=Fals
             to_a_key = inf_to.get('access')
             to_s_key = inf_to.get('secret')
 
-            from_conn = S3Connector("From Connector", from_host, from_port, access=from_a_key, secret=from_s_key)
-            to_conn = S3Connector("To Connector", to_host, to_port, access=to_a_key, secret=to_s_key)
+            from_conn = S3Connector(username, from_host, from_port, access=from_a_key, secret=from_s_key)
+            to_conn = S3Connector(username, to_host, to_port, access=to_a_key, secret=to_s_key)
 
-            copy_buckets(from_conn, to_conn, thread_count, allow_ow, verbose, bmap=bkt_map)
+            copy_buckets(from_conn, to_conn, thread_count, allow_ow, verbose, bmap=bkt_map, jobs=jobs)
 
 if __name__ == "__main__":
 
@@ -233,12 +278,19 @@ if __name__ == "__main__":
                         required = False,
                         type = int,
                         default = 1)
+    parser.add_argument('-j', '--jobs',
+                        help='Number of process jobs',
+                        dest='jobs',
+                        required = False,
+                        type = int,
+                        default = 1)
     args = parser.parse_args()
 
     config = args.config
     thd_count = args.thread_count
     verbose = args.verbose
     overwrite = args.overwrite
+    jobs = args.jobs
 
-    sync_users(config, thd_count, overwrite, verbose)
+    sync_users(config, thd_count, overwrite, verbose, jobs)
 

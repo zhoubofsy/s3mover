@@ -9,6 +9,8 @@ Script to copy all files from an S3 user to another user in a different cluster.
 
 ``` shell
 pip install -U boto
+pip install -U leveldb
+pip install -U filechunkio
 ```
 
 ## Configuration
@@ -19,6 +21,7 @@ Example:
 ``` json
 [
     {
+        "name":"admin1",
         "from":{
             "host":"10.100.13.111",
             "port":7480,
@@ -37,6 +40,7 @@ Example:
         }
     },
     {
+        "name":"admin2",
         "from":{
             "host":"10.100.13.111",
             "port":7480,
@@ -65,10 +69,10 @@ or
 python s3mover.py
 ```
 
-When dealing with a very large number of files, you might want to try to use more worker threads:
+When dealing with a very large number of files, you might want to try to use more worker threads and Process:
 
 ``` shell
-python s3mover.py -t 100
+python s3mover.py -t 100 -j 8
 ```
 
 # Thanks
